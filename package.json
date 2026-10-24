@@ -1,0 +1,25 @@
+{
+  "name": "asr-transcribe-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible transcription server backed by Meta Muse Voyager ASR",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "muse-dictate": "./bin/muse-dictate.mjs"
+  },
+  "scripts": {
+    "probe": "node bin/muse-dictate.mjs --probe",
+    "test": "node --test test/*.test.mjs",
+    "devices": "node bin/muse-dictate.mjs --list-devices",
+    "server": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "opencc-js": "^1.4.2",
+    "ws": "^8.22.0"
+  }
+}
