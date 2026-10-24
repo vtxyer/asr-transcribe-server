@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * asr-transcribe-server — OpenAI-compatible transcription API backed by Meta Muse's
- * Voyager ASR endpoint.
+ * Voyager ASR endpoint and ElevenLabs Scribe V2.
  *
  *   POST /v1/audio/transcriptions   (multipart/form-data, field `file`)
  *   POST /v1/audio/translations     (501 — Muse only transcribes)
@@ -25,6 +25,7 @@ import { join } from "node:path";
 import Busboy from "busboy";
 
 import { transcribe } from "./src/transcribe.mjs";
+import { isScribeModel, SCRIBE_MODEL, transcribeElevenLabs } from "./src/elevenlabs.mjs";
 import { attachVolcengineWs } from "./src/volcengine-ws.mjs";
 import { decodeToPcmChunks } from "./src/mic.mjs";
 import { guessLanguage } from "./src/text.mjs";
@@ -189,17 +190,19 @@ function renderBody(format, { text, durationMs, language }) {
 }
 
 async function handleTranscription(req, res, startedAt) {
-  const token = await tokenForRequest();
-  if (!token) {
-    return openaiError(res, 503, "no Muse token configured (set MUSE_TOKEN or MUSE_TOKEN_FILE)", "server_error", "no_token");
-  }
-
   const dir = await mkdtemp(join(tmpdir(), "muse-asr-"));
   let fields = {};
   let file = null;
   try {
     ({ fields, file } = await parseMultipart(req, dir));
 
+    const useScribe = isScribeModel(fields.model);
+    const token = useScribe ? process.env.ELEVENLABS_API_KEY?.trim() : await tokenForRequest();
+    if (!token) {
+      return openaiError(res, 503,
+        useScribe ? "no ElevenLabs token configured (set ELEVENLABS_API_KEY)" : "no Muse token configured (set MUSE_TOKEN or MUSE_TOKEN_FILE)",
+        "server_error", useScribe ? "no_elevenlabs_token" : "no_token");
+    }
     const format = (fields.response_format || "json").toLowerCase();
     const speed = Number(fields.speed ?? SPEED) || SPEED;
 
@@ -219,7 +222,11 @@ async function handleTranscription(req, res, startedAt) {
       }
     }
 
-    const result = await transcribe({
+    const result = useScribe ? await transcribeElevenLabs({
+      source: guarded(),
+      token,
+      language: fields.language,
+    }) : await transcribe({
       sourceFactory: () => guarded(),
       token,
       model: MODEL_NAME,
@@ -234,6 +241,8 @@ async function handleTranscription(req, res, startedAt) {
 
     res.museInfo = {
       route: "transcriptions",
+      provider: useScribe ? "elevenlabs" : "muse",
+      model: useScribe ? SCRIBE_MODEL : MODEL_NAME,
       audioSec: Number((result.audioMs / 1000).toFixed(2)),
       speed,
       chars: text.length,
@@ -332,7 +341,7 @@ const server = createServer(async (req, res) => {
       message: "OpenAI-compatible transcription API. 實際打的是 /v1/audio/transcriptions，要帶 Bearer key。",
       auth: 'Authorization: Bearer <MUSE_API_KEY>',
       endpoints: {
-        "POST /v1/audio/transcriptions": "multipart/form-data: file, model(任意), language, response_format",
+        "POST /v1/audio/transcriptions": "multipart/form-data: file, model(含 scribe 不分大小寫 → ElevenLabs Scribe V2；其餘 → Muse), language, response_format",
         "POST /v1/audio/translations": "501",
         "GET /v1/models": "list",
         "GET /health": "no auth",
@@ -352,14 +361,14 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && bare === "/models") {
-    // 只是給 client 的 model picker 看的；實際上 model 參數完全不影響後端
+    // Model aliases keep using Muse unless the name contains "scribe".
     return sendJson(res, 200, {
       object: "list",
-      data: ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", MODEL_NAME].map((id) => ({
+      data: ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", MODEL_NAME, SCRIBE_MODEL].map((id) => ({
         id,
         object: "model",
         created: 0,
-        owned_by: "meta-muse",
+        owned_by: isScribeModel(id) ? "elevenlabs" : "meta-muse",
       })),
     });
   }
@@ -371,7 +380,7 @@ const server = createServer(async (req, res) => {
       id: decodeURIComponent(modelMatch[1]),
       object: "model",
       created: 0,
-      owned_by: "meta-muse",
+      owned_by: isScribeModel(decodeURIComponent(modelMatch[1])) ? "elevenlabs" : "meta-muse",
     });
   }
 
