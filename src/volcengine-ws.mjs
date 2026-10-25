@@ -87,6 +87,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
     };
 
     let finishTimer = null;
+    let endRequested = false;
     const finish = (reason = "client_last_packet") => {
       if (finalSent || closed) return;
       finalSent = true;
@@ -158,6 +159,9 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
           fullText = t;
           emit(true);
         }
+        // Upstream sends the final ~0.2 s after endStream but only closes the
+        // socket ~1 s later; nothing arrives in between, so answer right away.
+        if (endRequested) finish("upstream_final");
       });
       voyager.on("close", () => {
         if (!finalSent && !closed) finish("upstream_closed");
@@ -226,6 +230,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
 
     function requestFinish() {
       if (finalSent || closed) return;
+      endRequested = true;
       try {
         voyager?.endStream();
       } catch {}
