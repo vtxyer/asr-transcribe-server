@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
  * asr-transcribe-server — OpenAI-compatible transcription API backed by Meta Muse's
- * Voyager ASR endpoint and ElevenLabs Scribe V2.
+ * Voyager ASR endpoint, ElevenLabs Scribe V2, and the Doubao IME voice endpoint.
+ *
+ * 後端依 `model` 名稱路由（不分大小寫）：
+ *   含 doubao → 豆包輸入法語音；含 scribe → ElevenLabs Scribe V2；其餘 → Meta Muse.
  *
  *   POST /v1/audio/transcriptions   (multipart/form-data, field `file`)
  *   POST /v1/audio/translations     (501 — Muse only transcribes)
@@ -26,6 +29,7 @@ import Busboy from "busboy";
 
 import { transcribe } from "./src/transcribe.mjs";
 import { isScribeModel, SCRIBE_MODEL, transcribeElevenLabs } from "./src/elevenlabs.mjs";
+import { DOUBAO_MODEL, isDoubaoModel, transcribeDoubao } from "./src/doubao.mjs";
 import { attachVolcengineWs } from "./src/volcengine-ws.mjs";
 import { decodeToPcmChunks } from "./src/mic.mjs";
 import { guessLanguage } from "./src/text.mjs";
@@ -196,9 +200,10 @@ async function handleTranscription(req, res, startedAt) {
   try {
     ({ fields, file } = await parseMultipart(req, dir));
 
-    const useScribe = isScribeModel(fields.model);
-    const token = useScribe ? process.env.ELEVENLABS_API_KEY?.trim() : await tokenForRequest();
-    if (!token) {
+    const useDoubao = isDoubaoModel(fields.model);
+    const useScribe = !useDoubao && isScribeModel(fields.model);
+    const token = useDoubao ? null : useScribe ? process.env.ELEVENLABS_API_KEY?.trim() : await tokenForRequest();
+    if (!token && !useDoubao) {
       return openaiError(res, 503,
         useScribe ? "no ElevenLabs token configured (set ELEVENLABS_API_KEY)" : "no Muse token configured (set MUSE_TOKEN or MUSE_TOKEN_FILE)",
         "server_error", useScribe ? "no_elevenlabs_token" : "no_token");
@@ -222,7 +227,9 @@ async function handleTranscription(req, res, startedAt) {
       }
     }
 
-    const result = useScribe ? await transcribeElevenLabs({
+    const result = useDoubao ? await transcribeDoubao({
+      source: guarded(),
+    }) : useScribe ? await transcribeElevenLabs({
       source: guarded(),
       token,
       language: fields.language,
@@ -241,8 +248,9 @@ async function handleTranscription(req, res, startedAt) {
 
     res.museInfo = {
       route: "transcriptions",
-      provider: useScribe ? "elevenlabs" : "muse",
-      model: useScribe ? SCRIBE_MODEL : MODEL_NAME,
+      provider: useDoubao ? "doubao" : useScribe ? "elevenlabs" : "muse",
+      model: useDoubao ? DOUBAO_MODEL : useScribe ? SCRIBE_MODEL : MODEL_NAME,
+      device: useDoubao ? result.deviceId : undefined,
       audioSec: Number((result.audioMs / 1000).toFixed(2)),
       speed,
       chars: text.length,
@@ -341,7 +349,7 @@ const server = createServer(async (req, res) => {
       message: "OpenAI-compatible transcription API. 實際打的是 /v1/audio/transcriptions，要帶 Bearer key。",
       auth: 'Authorization: Bearer <MUSE_API_KEY>',
       endpoints: {
-        "POST /v1/audio/transcriptions": "multipart/form-data: file, model(含 scribe 不分大小寫 → ElevenLabs Scribe V2；其餘 → Muse), language, response_format",
+        "POST /v1/audio/transcriptions": "multipart/form-data: file, model(含 doubao → 豆包輸入法；含 scribe → ElevenLabs Scribe V2；其餘 → Muse), language, response_format",
         "POST /v1/audio/translations": "501",
         "GET /v1/models": "list",
         "GET /health": "no auth",
@@ -361,14 +369,14 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && bare === "/models") {
-    // Model aliases keep using Muse unless the name contains "scribe".
+    // Model aliases keep using Muse unless the name contains "doubao" or "scribe".
     return sendJson(res, 200, {
       object: "list",
-      data: ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", MODEL_NAME, SCRIBE_MODEL].map((id) => ({
+      data: ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", MODEL_NAME, SCRIBE_MODEL, DOUBAO_MODEL].map((id) => ({
         id,
         object: "model",
         created: 0,
-        owned_by: isScribeModel(id) ? "elevenlabs" : "meta-muse",
+        owned_by: isDoubaoModel(id) ? "doubao" : isScribeModel(id) ? "elevenlabs" : "meta-muse",
       })),
     });
   }
@@ -380,7 +388,9 @@ const server = createServer(async (req, res) => {
       id: decodeURIComponent(modelMatch[1]),
       object: "model",
       created: 0,
-      owned_by: isScribeModel(decodeURIComponent(modelMatch[1])) ? "elevenlabs" : "meta-muse",
+      owned_by: isDoubaoModel(decodeURIComponent(modelMatch[1]))
+        ? "doubao"
+        : isScribeModel(decodeURIComponent(modelMatch[1])) ? "elevenlabs" : "meta-muse",
     });
   }
 
