@@ -232,3 +232,74 @@ test("other and omitted model names keep the configured Muse model and shared po
     assert.equal(response.headers.get("x-muse-session"), "muse-session");
   }
 });
+
+function clientFrame(type, flags, payload, sequence) {
+  const head = Buffer.from([0x11, (type << 4) | flags, type === 0x1 ? 0x10 : 0x00, 0x00]);
+  const seq = Buffer.alloc(4);
+  seq.writeInt32BE(sequence, 0);
+  const size = Buffer.alloc(4);
+  size.writeUInt32BE(payload.length, 0);
+  return Buffer.concat([head, seq, size, payload]);
+}
+
+function serverPayload(buf) {
+  let offset = (buf[0] & 0x0f) * 4;
+  const flags = buf[1] & 0x0f;
+  if (flags === 0x1 || flags === 0x3) offset += 4;
+  const size = buf.readUInt32BE(offset);
+  return { isLast: flags === 0x2 || flags === 0x3, json: JSON.parse(buf.subarray(offset + 4, offset + 4 + size).toString("utf8")) };
+}
+
+test("streaming finish keeps the sentence still in progress without waiting for speechComplete", { timeout: 15000 }, async (t) => {
+  const run = await launch(t, {
+    overrides: { MUSE_API_KEY: "test-key", MUSE_TOKEN: "test-muse" },
+    preload: `
+      globalThis.WebSocket = class {
+        addEventListener(name, handler) { this["on" + name] = handler; }
+        constructor() {
+          this.readyState = 0;
+          setImmediate(() => { this.readyState = 1; this.onopen?.(); });
+        }
+        emit(obj) { this.onmessage?.({ data: JSON.stringify(obj) }); }
+        send(data) {
+          if (typeof data !== "string") return;
+          const message = JSON.parse(data);
+          if (message.authorization) {
+            setImmediate(() => {
+              this.emit({ sessionId: "muse-session" });
+              // Segment one: upstream final, then speechComplete for the same text.
+              this.emit({ transcript: { transcript: "first sentence", final: true } });
+              this.emit({ speechComplete: { turnId: 1, transcript: "first sentence" } });
+              this.emit({ transcript: { transcript: "second", final: false } });
+            });
+          }
+          if (message.endStream) {
+            // Segment two only gets its final; speechComplete never arrives.
+            setImmediate(() => this.emit({ transcript: { transcript: "second sentence", final: true } }));
+            setTimeout(() => this.close(1000), 1000);
+          }
+        }
+        close(code) { if (this.readyState === 3) return; this.readyState = 3; this.onclose?.({ code, reason: "done" }); }
+      };
+    `,
+  });
+  const base = await waitForServer(run);
+  const ws = new WebSocket(base.replace("http:", "ws:") + "/api/v3/sauc/bigmodel", { headers: { "X-Api-Key": "test-key" } });
+  const frames = [];
+  ws.on("message", (data) => frames.push(serverPayload(Buffer.from(data))));
+  await once(ws, "open");
+  const config = { audio: { format: "pcm", rate: 16000, bits: 16, channel: 1 }, request: { model_name: "bigmodel", show_utterances: true } };
+  ws.send(clientFrame(0x1, 0x1, Buffer.from(JSON.stringify(config)), 1));
+  ws.send(clientFrame(0x2, 0x1, Buffer.alloc(3200), 2));
+  await delay(200);
+  const sentAt = Date.now();
+  ws.send(clientFrame(0x2, 0x3, Buffer.alloc(0), -3));
+  await once(ws, "close");
+  const last = frames.at(-1);
+  assert.equal(last.isLast, true);
+  const definite = last.json.result.utterances.filter((u) => u.definite).map((u) => u.text);
+  assert.deepEqual(definite, ["first sentence", "second sentence"]);
+  assert.equal(last.json.result.text, "first sentence second sentence");
+  // Answered on the upstream final, not after upstream close or the 6 s timer.
+  assert.ok(Date.now() - sentAt < 900, `finish took ${Date.now() - sentAt}ms`);
+});

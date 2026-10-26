@@ -69,6 +69,14 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
     let lastEmit = 0;
     let audioMs = 0;
     let lastPartial = "";
+    // Text of the segment still being spoken (partial or upstream final that
+    // has not been followed by speechComplete yet). Folded into the definite
+    // result on finish so the last sentence is never dropped.
+    let tail = "";
+    const composeText = () =>
+      normalizeTranscript([...utterances.map((u) => u.text), tail].filter(Boolean).join(" "));
+    const payloadUtterances = () =>
+      tail ? [...utterances, { text: tail, startTime: utterances.at(-1)?.endTime ?? 0, endTime: audioMs, definite: false }] : utterances;
 
     const send = (payload, { isLast = false } = {}) => {
       if (closed || ws.readyState !== ws.OPEN) return;
@@ -83,7 +91,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       if (fullText === lastSent) return; // 文字沒變就不重送
       lastEmit = now;
       lastSent = fullText;
-      send(buildResultPayload({ text: fullText, utterances, duration: audioMs, showUtterances }));
+      send(buildResultPayload({ text: fullText, utterances: payloadUtterances(), duration: audioMs, showUtterances }));
     };
 
     let finishTimer = null;
@@ -92,6 +100,11 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       if (finalSent || closed) return;
       finalSent = true;
       if (finishTimer) clearTimeout(finishTimer);
+      if (tail) {
+        utterances.push({ text: tail, startTime: utterances.at(-1)?.endTime ?? 0, endTime: audioMs, definite: true });
+        tail = "";
+        fullText = composeText();
+      }
       const text = fullText;
       if (!text) {
         send({ error: "no transcript", code: 20000003 }, { isLast: true });
@@ -133,7 +146,8 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
         const t = normalizeTranscript(m.transcript || "");
         if (t) {
           lastPartial = t;
-          fullText = t;
+          tail = t;
+          fullText = composeText();
           emit();
         }
       });
@@ -148,15 +162,19 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
         const end = typeof m.audioProcessedMs === "number" ? m.audioProcessedMs : audioMs;
         if (t) {
           utterances.push({ text: t, startTime: utterances.length ? utterances.at(-1).endTime : 0, endTime: end, definite: true });
-          fullText = normalizeTranscript(utterances.map((u) => u.text).join(" "));
         }
+        tail = "";
+        fullText = composeText();
         audioMs = Math.max(audioMs, end);
         emit(true);
       });
       voyager.on("final", (m) => {
         const t = normalizeTranscript(m.transcript || "");
-        if (t) {
-          fullText = t;
+        // Upstream final is per segment; a duplicate of the segment that
+        // speechComplete already committed must not be re-added as tail.
+        if (t && !(tail === "" && utterances.at(-1)?.text === t)) {
+          tail = t;
+          fullText = composeText();
           emit(true);
         }
         // Upstream sends the final ~0.2 s after endStream but only closes the
