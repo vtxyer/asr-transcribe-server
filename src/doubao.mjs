@@ -358,6 +358,7 @@ async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime 
   const url = `${WS_URL}?aid=${AID}&device_id=${cred.device_id}`;
   const ws = new WebSocket(url, {
     headers: { "User-Agent": UA, "proto-version": "v2", "x-custom-keepalive": "true" },
+    family: 4, // VPS has no IPv6 route; Node resolves the WS host to IPv6 first and the connect times out, so force IPv4
   });
 
   let finalText = "";
