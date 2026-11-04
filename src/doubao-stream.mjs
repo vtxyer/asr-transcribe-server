@@ -37,6 +37,7 @@ import {
   decodeAsrResponse,
   encodeAsrRequest,
   ensureCredentials,
+  isNewSegment,
   recoverCredentials,
 } from "./doubao.mjs";
 
@@ -91,6 +92,7 @@ export class DoubaoStream extends EventEmitter {
     // 目前這段
     this.seg = null; // { text, st, index, firstPos, lastDurMs, offsetMs }
     this.lastEndMs = 0;
+    this.lastCommit = null;
   }
 
   get audioMs() {
@@ -381,11 +383,11 @@ export class DoubaoStream extends EventEmitter {
       const index = item.index ?? 0;
       const cur = this.seg;
 
-      const newSegment =
-        cur &&
-        (cur.session !== s ||
-          index !== cur.index ||
-          (st != null && cur.st != null && st - cur.st > 5));
+      // 剛定稿那段的重複 final（同 session、同文字或同 start_time）直接略過
+      const lc = this.lastCommit;
+      if (!cur && lc && lc.session === s && (lc.text === text || (st != null && lc.st != null && Math.abs(st - lc.st) < 0.05))) continue;
+
+      const newSegment = cur && (cur.session !== s || isNewSegment(cur, item));
       if (newSegment) {
         // 新段的起點（全域 ms）就是上一段的結尾
         const startMs = st != null ? s.offsetMs + st * 1000 : this.audioMs;
@@ -441,6 +443,7 @@ export class DoubaoStream extends EventEmitter {
     const startMs = Math.max(this.lastEndMs, seg.startMs);
     const end = Math.max(startMs, Math.round(endMs ?? this.audioMs));
     this.lastEndMs = end;
+    this.lastCommit = { session: seg.session, text: seg.text, st: seg.st };
     this.seg = null;
     this.emit("definite", { text: seg.text, startMs, endMs: end });
   }

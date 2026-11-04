@@ -413,3 +413,57 @@ test("WS doubao 路線：上游憑證一直被拒 → client 收到錯誤框", a
   assert.equal(msgs.at(-1).messageType, MSG.ERROR);
   assert.match(JSON.parse(msgs.at(-1).payload.toString()).error, /upstream failed/);
 });
+
+// ── HTTP 批次路徑（transcribeDoubao）：多段要全部保留 ────────────────────
+test("SegmentAccumulator：多段依序累積、重複 final 不重複、拉丁字之間補空白", async () => {
+  const { SegmentAccumulator } = await import("../src/doubao.mjs");
+  const a = new SegmentAccumulator();
+  a.add({ text: "第一", start_time: 0, is_interim: true, index: 0 });
+  a.add({ text: "第一段。", start_time: 0, is_interim: false, index: 0 });
+  a.add({ text: "第一段。", start_time: 0, is_interim: false, index: 0 }); // 重複 final
+  a.add({ text: "第二段 use", start_time: 6.2, is_interim: true, index: 0 }); // start_time 跳
+  a.add({ text: "RAID", start_time: 6.4, is_interim: true, index: 1 }); // index 變
+  a.add({ text: "RAID 5", start_time: 6.4, is_interim: true, index: 1 });
+  assert.equal(a.text(), "第一段。第二段 use RAID 5");
+});
+
+test("transcribeDoubao：長音檔多段（>25 s）全部保留，不只最後一段", async (t) => {
+  const { transcribeDoubao } = await import("../src/doubao.mjs");
+  const up = await fakeDoubao(t, {
+    script: ({ frames: f, frameState, send }) => {
+      const r = (text, st, interim, index = 0) => send({ result: { results: [{ text, start_time: st, is_interim: interim, index }], extra: { audio_duration: f * 20 } } });
+      if (f === 10) r("这是第一", 0, true);
+      if (f === 20) r("这是第一段。", 0, false);
+      if (f === 25) r("这是第一段。", 0, false); // 上游偶爾重送同一個 final
+      if (f === 40) r("第二段", 26, true);
+      if (f === 50) r("第二段讲完了。", 26, true);
+      if (f === 70) r("第三", 52, true, 1);
+      if (frameState === FRAME_STATE.LAST) r("第三段收尾", 52, true, 1); // 沒有 final，只有 interim
+    },
+  });
+  const dir = await mkdtemp(join(tmpdir(), "doubao-batch-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const credentialPath = join(dir, "cred.json");
+  await writeFile(credentialPath, JSON.stringify(cred));
+  const pcm24 = Buffer.alloc(24_000 * 2 * 2); // 2 s @ 24 kHz → 100 個 16 kHz 幀
+  const r = await transcribeDoubao({ source: pcm24, credentialPath, wsUrl: up.url, retries: 0, timeoutMs: 5000 });
+  assert.equal(r.text, "這是第一段。第二段講完了。第三段收尾");
+  assert.equal(up.state.sessions.length, 1);
+});
+
+test("串流：同一段的重複 final 不會變成兩個 definite", async (t) => {
+  const up = await fakeDoubao(t, {
+    script: ({ frames: f, send }) => {
+      const fin = { result: { results: [{ text: "一句。", start_time: 0, is_interim: false, index: 0 }], extra: { audio_duration: 200 } } };
+      if (f === 10 || f === 15) send(fin);
+      if (f === 20) send({ result: interim("下一句", 0.5, 400) });
+    },
+  });
+  const s = new DoubaoStream({ wsUrl: up.url, getCredentials: async () => cred, recover: async () => false });
+  const ev = collect(s);
+  s.start();
+  await feed(s, 25);
+  await waitFor(() => ev.partial.some((p) => p.text === "下一句"));
+  await s.finish();
+  assert.deepEqual(ev.definite.map((d) => d.text), ["一句。", "下一句"]);
+});

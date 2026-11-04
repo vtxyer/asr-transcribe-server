@@ -336,6 +336,62 @@ export async function createOpusEncoder(sampleRate = SR, channels = 1) {
   };
 }
 
+/**
+ * 段落判斷（批次與串流共用）：上游的 result 只帶目前這段的完整文字（會回頭改字）。
+ * 新段的訊號：index 變了、start_time 往後跳超過 5 s、或上一段已收到 is_interim=false。
+ * 同一段的重複 final（文字與 start_time 都一樣）不算新段。
+ */
+export function isNewSegment(cur, item) {
+  if (!cur) return false;
+  const st = Number.isFinite(item.start_time) ? item.start_time : null;
+  const index = item.index ?? 0;
+  if (index !== cur.index) return true;
+  if (st != null && cur.st != null && st - cur.st > 5) return true;
+  if (cur.done) {
+    const sameStart = st != null && cur.st != null && Math.abs(st - cur.st) < 0.05;
+    return !(item.text === cur.text || sameStart);
+  }
+  return false;
+}
+
+/** 中文段落直接接，兩邊都是拉丁字才補空白 */
+export function joinSegments(parts) {
+  let out = "";
+  for (const p of parts) {
+    if (!p) continue;
+    if (out && /[A-Za-z0-9]$/.test(out) && /^[A-Za-z0-9]/.test(p)) out += " ";
+    out += p;
+  }
+  return out;
+}
+
+/** 批次用：依序收集每段的最後文字 */
+export class SegmentAccumulator {
+  constructor() {
+    this.done = [];
+    this.cur = null;
+  }
+
+  /** 回傳文字是否有變 */
+  add(item) {
+    const text = item?.text;
+    if (!text) return false;
+    if (isNewSegment(this.cur, item)) {
+      this.done.push(this.cur.text);
+      this.cur = null;
+    }
+    const st = Number.isFinite(item.start_time) ? item.start_time : null;
+    if (!this.cur) this.cur = { text, st, index: item.index ?? 0, done: false };
+    else this.cur.text = text;
+    if (item.is_interim === false) this.cur.done = true;
+    return true;
+  }
+
+  text() {
+    return joinSegments([...this.done, this.cur?.text]);
+  }
+}
+
 /** StartSession 的 JSON（批次與串流共用）。 */
 export function buildSessionConfig(cred, session = {}) {
   return {
@@ -374,7 +430,7 @@ export async function recoverCredentials(err, cred, credentialPath = DEFAULT_CRE
 
 // ── 主流程 ─────────────────────────────────────────────────────────
 /** 單次嘗試：憑證已備妥，只負責連線、送音訊、收結果。 */
-async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime = false, session = {} }) {
+async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime = false, session = {}, wsUrl = process.env.DOUBAO_WS_URL?.trim() || WS_URL }) {
   const { default: WebSocket } = await import("ws");
   const encoder = await createOpusEncoder();
 
@@ -382,14 +438,14 @@ async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime 
   const requestId = randomUUID();
   const sessionConfig = buildSessionConfig(cred, session);
 
-  const url = `${WS_URL}?aid=${AID}&device_id=${cred.device_id}`;
+  const url = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}aid=${AID}&device_id=${cred.device_id}`;
   const ws = new WebSocket(url, {
     headers: { "User-Agent": UA, "proto-version": "v2", "x-custom-keepalive": "true" },
     family: 4, // VPS has no IPv6 route; Node resolves the WS host to IPv6 first and the connect times out, so force IPv4
   });
 
-  let finalText = "";
-  let interimText = "";
+  // 上游每次只回「目前這段」的文字，段換了就不再提前面的段，所以要自己累積
+  const segments = new SegmentAccumulator();
   let started = false;
   let finished = false;
   let failure = null;
@@ -470,12 +526,9 @@ async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime 
         return;
       }
       if (Number.isFinite(json?.extra?.duration)) audioMs = json.extra.duration * 1000;
-      for (const item of json.results || []) {
-        if (!item?.text) continue;
-        if (item.is_interim === false) finalText = item.text;
-        else interimText = item.text;
-      }
-      if (interimText && onPartial) onPartial(finalText || interimText);
+      let changed = false;
+      for (const item of json.results || []) changed = segments.add(item) || changed;
+      if (changed && onPartial) onPartial(segments.text());
     }
   });
 
@@ -584,10 +637,10 @@ async function runOnce({ source, cred, onPartial, timeoutMs = 120_000, realtime 
     } catch {}
   }
 
-  if (failure && !finalText) throw failure;
+  if (failure && !segments.text()) throw failure;
 
   return {
-    text: finalText || interimText,
+    text: segments.text(),
     audioMs,
     frames: chunksSent,
     requestId,
@@ -625,6 +678,7 @@ export async function transcribeDoubao({
   timeoutMs = Number(process.env.DOUBAO_TIMEOUT_MS || 180_000),
   retries = Number(process.env.DOUBAO_RETRIES ?? 1),
   session = {},
+  wsUrl,
 }) {
   const startedAt = Date.now();
 
@@ -643,7 +697,7 @@ export async function transcribeDoubao({
   for (let attempt = 0; attempt <= retries; attempt++) {
     const cred = await ensureCredentials(credentialPath);
     try {
-      const result = await runOnce({ source: pcm, cred, timeoutMs, session });
+      const result = await runOnce({ source: pcm, cred, timeoutMs, session, ...(wsUrl ? { wsUrl } : {}) });
       const rawText = result.text ?? "";
       return {
         text: normalizeTranscript(rawText),
