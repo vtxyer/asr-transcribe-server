@@ -12,6 +12,7 @@ import { WebSocketServer } from "ws";
 import { VoyagerClient } from "./voyager.mjs";
 import { MODE, padToChunk, BYTES_PER_CHUNK } from "./protocol.mjs";
 import { normalizeTranscript } from "./text.mjs";
+import { DoubaoStream } from "./doubao-stream.mjs";
 import {
   MSG,
   Upsampler16to24,
@@ -23,7 +24,17 @@ import {
 
 const WS_PATHS = /^\/api\/v3\/sauc\/bigmodel(_nostream|_async)?\/?$/;
 
-export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey, log = console.log }) {
+/**
+ * 選上游：?model=doubao_ime（含 doubao 即可），或 X-Api-Resource-Id 含 "doubao" → 豆包輸入法；
+ * 其餘（含沒帶）→ Muse，跟以前一樣。
+ */
+export function selectBackend(url, headers = {}) {
+  const model = url.searchParams.get("model") || "";
+  const resourceId = (headers["x-api-resource-id"] || "").toString();
+  return /doubao/i.test(model) || /doubao/i.test(resourceId) ? "doubao" : "muse";
+}
+
+export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey, log = console.log, doubaoOptions = {} }) {
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on("upgrade", (req, socket, head) => {
@@ -43,15 +54,17 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
     const reqId = (h["x-api-request-id"] || "").toString();
     const resourceId = (h["x-api-resource-id"] || "").toString();
     const ua = (h["user-agent"] || "").toString().slice(0, 40);
+    const backend = selectBackend(url, h);
 
     if (apiKey && given !== apiKey) {
-      log(JSON.stringify({ t: new Date().toISOString(), ws: "auth-reject", path: url.pathname, hasKey: !!given, resourceId, ua }));
+      log(JSON.stringify({ t: new Date().toISOString(), ws: "auth-reject", path: url.pathname, backend, hasKey: !!given, resourceId, ua }));
       ws.send(buildError("authentication failed: X-Api-Key mismatch", 45000001));
       ws.close(1008, "auth");
       return;
     }
 
     let voyager = null;
+    let doubao = null;
     let voyagerReady = false;
     let earlyAudio = [];
     let earlyBytes = 0;
@@ -116,6 +129,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
           t: new Date().toISOString(),
           ws: "done",
           path: url.pathname,
+          backend,
           reqId,
           resourceId,
           reason,
@@ -210,7 +224,44 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       });
     };
 
-    log(JSON.stringify({ t: new Date().toISOString(), ws: "open", path: url.pathname, reqId, resourceId, ua }));
+    const startDoubao = () => {
+      if (doubao) return;
+      doubao = new DoubaoStream(doubaoOptions);
+      doubao.on("partial", ({ text }) => {
+        const t = normalizeTranscript(text);
+        if (!t) return;
+        tail = t;
+        fullText = composeText();
+        emit();
+      });
+      doubao.on("definite", ({ text, startMs, endMs }) => {
+        const t = normalizeTranscript(text);
+        if (t) utterances.push({ text: t, startTime: startMs, endTime: endMs, definite: true });
+        tail = "";
+        fullText = composeText();
+        emit(true);
+      });
+      doubao.on("rollover", ({ reason, sessions }) => {
+        log(JSON.stringify({ t: new Date().toISOString(), ws: "doubao-rollover", reqId, reason, sessions, audioSec: Number((audioMs / 1000).toFixed(2)) }));
+      });
+      doubao.on("error", (err) => {
+        log(JSON.stringify({ t: new Date().toISOString(), ws: "doubao-error", code: err.code, msg: err.message }));
+        if (closed) return;
+        if (fullText) {
+          // 已經有內容就照常收尾，別把整場會議的結果丟掉
+          finish("upstream_error");
+          return;
+        }
+        try {
+          ws.send(buildError(`upstream failed: ${err.message}`, err.status === 401 ? 45000001 : 55000031, { compression }));
+          ws.close(1011, "upstream");
+        } catch {}
+        closed = true;
+      });
+      doubao.start();
+    };
+
+    log(JSON.stringify({ t: new Date().toISOString(), ws: "open", path: url.pathname, backend, reqId, resourceId, ua }));
 
     ws.on("message", (data, isBinary) => {
       if (closed) return;
@@ -249,6 +300,13 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
     function requestFinish() {
       if (finalSent || closed) return;
       endRequested = true;
+      if (backend === "doubao") {
+        if (!doubao) return finish("client_last_packet");
+        doubao.finish().then(() => finish("upstream_final"), () => finish("upstream_error"));
+        // 上游沒回應時的保險
+        finishTimer = setTimeout(() => finish("timeout"), 12_000);
+        return;
+      }
       try {
         voyager?.endStream();
       } catch {}
@@ -262,11 +320,14 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       showUtterances = !!request.show_utterances;
       const rate = Number(audio.rate || 16000);
       upsampler = rate === 16_000 ? new Upsampler16to24(16_000, 24_000) : null;
-      startVoyager();
+      if (backend === "doubao") {
+        if (upsampler) startDoubao();
+      } else startVoyager();
       log(
         JSON.stringify({
           t: new Date().toISOString(),
           ws: "config",
+          backend,
           format: audio.format,
           codec: audio.codec,
           rate,
@@ -296,6 +357,13 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
     function handleAudio(pcm16) {
       if (!upsampler || closed) return;
       bytesIn += pcm16.length;
+      if (backend === "doubao") {
+        // 豆包本來就吃 16 kHz，不用升頻
+        audioMs = Math.round(bytesIn / 32);
+        pcm24 = bytesIn * 1.5;
+        doubao?.pushPcm16(pcm16);
+        return;
+      }
       const up = upsampler.process(pcm16);
       if (!up.length) return;
       pcm24 += up.length;
@@ -318,6 +386,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       try {
         voyager?.close(1000);
       } catch {}
+      doubao?.close();
     });
 
     ws.on("error", () => {
@@ -325,6 +394,7 @@ export function attachVolcengineWs(httpServer, { token, getToken, model, apiKey,
       try {
         voyager?.close(1000);
       } catch {}
+      doubao?.close();
     });
   });
 
